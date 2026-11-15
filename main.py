@@ -33,7 +33,7 @@ PROBE_TIMEOUT = 5.0
 WORK_TIMEOUT = 2.0
 REGISTER_TIMEOUT = 5.0
 MAX_BODY = 32 * 1024 * 1024
-MAX_ATTEMPTS = 10
+MAX_ATTEMPTS = 14
 
 PROVIDERS_SCHEMA = "free-model-aggregator-01/providers/v1"
 RATINGS_SCHEMA = "free-model-aggregator-01/ratings/v1"
@@ -710,12 +710,20 @@ def anthropic_to_openai(body, model):
     return out
 
 
+DEFAULT_ANTHROPIC_MAX_TOKENS = 1024
+
+
 def openai_to_anthropic_req(body, model):
     """An OpenAI Chat Completions request as an Anthropic Messages request.
 
-    The reverse of anthropic_to_openai: system messages become the top-level
-    system string, image_url parts become image blocks, tool_calls become
-    tool_use blocks, tool messages become tool_result blocks.
+    System messages become the top-level system string, image_url parts
+    become image blocks, tool_calls become tool_use blocks, and tool
+    messages become tool_result blocks. Anthropic requires max_tokens on
+    every request, so one is always supplied: the request's own max_tokens
+    when it has one, else its max_completion_tokens, else a fixed default
+    of 1024. An OpenAI request that omits both caps is still a valid
+    request on the OpenAI side, and routing it to an Anthropic-wire
+    provider must not turn it into a 400.
     """
     system_parts = []
     messages = []
@@ -772,8 +780,12 @@ def openai_to_anthropic_req(body, model):
     system = "\n".join(system_parts)
     if system != "":
         out["system"] = system
+    cap = None
     if isinstance(body.get("max_tokens"), (int, float)):
-        out["max_tokens"] = body["max_tokens"]
+        cap = body["max_tokens"]
+    elif isinstance(body.get("max_completion_tokens"), (int, float)):
+        cap = body["max_completion_tokens"]
+    out["max_tokens"] = int(cap) if cap is not None else DEFAULT_ANTHROPIC_MAX_TOKENS
     if isinstance(body.get("temperature"), (int, float)):
         out["temperature"] = body["temperature"]
     if isinstance(body.get("top_p"), (int, float)):
@@ -802,6 +814,8 @@ def openai_to_anthropic_req(body, model):
         out["tool_choice"] = {"type": "auto"}
     elif choice == "required":
         out["tool_choice"] = {"type": "any"}
+    elif choice == "none":
+        out["tool_choice"] = {"type": "none"}
     elif isinstance(choice, dict) and choice.get("type") == "function":
         fn = choice.get("function") if isinstance(choice.get("function"), dict) else {}
         if isinstance(fn.get("name"), str):
@@ -1161,18 +1175,40 @@ def gemini_to_openai(answer, model):
 
 
 def gemini_to_anthropic(answer, model):
-    """A Gemini generateContent answer as an Anthropic Messages object."""
-    text, _tool_calls = _gemini_text(answer)
+    """A Gemini generateContent answer as an Anthropic Messages object.
+
+    Text parts become one text block; every functionCall part becomes a
+    tool_use block, with the call id carried over from _gemini_text and
+    the arguments parsed back to an object. When the answer carries tool
+    calls the stop reason is tool_use, not end_turn, so the client knows
+    to run the tools and come back. Dropping the calls would turn a
+    tool-using answer into plain text and lose the work the model did.
+    """
+    text, tool_calls = _gemini_text(answer)
     candidates = answer.get("candidates") if isinstance(answer.get("candidates"), list) else []
     finish = candidates[0].get("finishReason") if candidates and isinstance(candidates[0], dict) else None
     prompt, completion, _total = _gemini_usage(answer)
+    blocks = []
+    if text != "":
+        blocks.append({"type": "text", "text": text})
+    for call in tool_calls or []:
+        fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+        blocks.append({
+            "type": "tool_use",
+            "id": call.get("id") if isinstance(call.get("id"), str) and call.get("id") != "" else "toolu_gemini",
+            "name": fn.get("name") if isinstance(fn.get("name"), str) else "",
+            "input": parse_json_obj(fn.get("arguments")),
+        })
+    stop = gemini_to_anth_stop(finish)
+    if blocks and any(b.get("type") == "tool_use" for b in blocks):
+        stop = "tool_use"
     return {
         "id": "msg_sim",
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": [{"type": "text", "text": text}],
-        "stop_reason": gemini_to_anth_stop(finish),
+        "content": blocks,
+        "stop_reason": stop,
         "stop_sequence": None,
         "usage": {"input_tokens": prompt, "output_tokens": completion},
     }
@@ -1387,14 +1423,65 @@ def anthropic_events_from_openai(frames, model):
     return out
 
 
+def _openai_tool_chunk(model, index, call_id, name, arguments):
+    """One OpenAI chat-completion chunk carrying a tool-call delta.
+
+    The first chunk for a call carries the id, the name and an empty
+    arguments string; later chunks carry only argument fragments. The
+    caller fills in the finish reason on the closing chunk.
+    """
+    call = {"index": index, "type": "function", "function": {"arguments": arguments}}
+    if call_id is not None:
+        call["id"] = call_id
+    if name is not None:
+        call["function"]["name"] = name
+    return {
+        "id": "chatcmpl-sim",
+        "object": "chat.completion.chunk",
+        "created": FIXED_CREATED,
+        "model": model,
+        "choices": [{"index": 0, "delta": {"tool_calls": [call]}, "finish_reason": None}],
+    }
+
+
 def anthropic_sse_to_openai(frames, model):
-    """An Anthropic SSE stream as OpenAI chat-completion chunks + usage + [DONE]."""
+    """An Anthropic SSE stream as OpenAI chat-completion chunks + usage + [DONE].
+
+    Text deltas become content chunks. A tool_use block becomes an OpenAI
+    tool call: content_block_start carries its id and name, and every
+    input_json_delta appends its argument fragment, so the client's tool
+    call is complete by the time the stream ends. When the message stops
+    with tool_use, the closing chunk's finish reason is tool_calls, not
+    stop, so the client knows to run the tools. Dropping the tool events
+    would silently turn a tool-using answer into plain text.
+    """
     out = []
     started = False
     finished = False
     input_tokens = 0
     output_tokens = 0
     stop_reason = "stop"
+    tools = {}
+    next_tool = 0
+
+    def open_chunk():
+        nonlocal started
+        if not started:
+            out.append(sse_data(json.dumps(_openai_chunk(model, "", None), separators=(",", ":"))))
+            started = True
+
+    def close_stream():
+        nonlocal finished
+        if finished:
+            return
+        open_chunk()
+        finish = _openai_chunk(model, None, stop_reason)
+        finish["choices"][0]["delta"] = {}
+        out.append(sse_data(json.dumps(finish, separators=(",", ":"))))
+        out.append(sse_data(json.dumps(_openai_usage_chunk(model, input_tokens, output_tokens), separators=(",", ":"))))
+        out.append("data: [DONE]")
+        finished = True
+
     for _event, data in frames:
         try:
             obj = json.loads(data)
@@ -1407,12 +1494,27 @@ def anthropic_sse_to_openai(frames, model):
             message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
             usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
             input_tokens = num_or_zero(usage.get("input_tokens"))
-            out.append(sse_data(json.dumps(_openai_chunk(model, "", None), separators=(",", ":"))))
-            started = True
+            open_chunk()
+        elif kind == "content_block_start":
+            block = obj.get("content_block") if isinstance(obj.get("content_block"), dict) else {}
+            if block.get("type") == "tool_use":
+                index = obj.get("index") if isinstance(obj.get("index"), int) else -1
+                call_id = block.get("id") if isinstance(block.get("id"), str) and block.get("id") != "" else "call_%d" % next_tool
+                name = block.get("name") if isinstance(block.get("name"), str) else ""
+                tools[index] = {"oa_index": next_tool, "id": call_id, "name": name}
+                next_tool += 1
+                open_chunk()
+                out.append(sse_data(json.dumps(_openai_tool_chunk(model, tools[index]["oa_index"], call_id, name, ""), separators=(",", ":"))))
         elif kind == "content_block_delta":
             delta = obj.get("delta") if isinstance(obj.get("delta"), dict) else {}
             if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str) and delta["text"] != "":
+                open_chunk()
                 out.append(sse_data(json.dumps(_openai_chunk(model, delta["text"], None), separators=(",", ":"))))
+            elif delta.get("type") == "input_json_delta" and isinstance(delta.get("partial_json"), str) and delta["partial_json"] != "":
+                index = obj.get("index") if isinstance(obj.get("index"), int) else -1
+                if index in tools:
+                    open_chunk()
+                    out.append(sse_data(json.dumps(_openai_tool_chunk(model, tools[index]["oa_index"], None, None, delta["partial_json"]), separators=(",", ":"))))
         elif kind == "message_delta":
             delta = obj.get("delta") if isinstance(obj.get("delta"), dict) else {}
             reason = delta.get("stop_reason")
@@ -1420,31 +1522,49 @@ def anthropic_sse_to_openai(frames, model):
                 stop_reason = anth_to_oa_stop(reason)
             usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
             output_tokens = num_or_zero(usage.get("output_tokens"))
-            finish = _openai_chunk(model, None, stop_reason)
-            finish["choices"][0]["delta"] = {}
-            out.append(sse_data(json.dumps(finish, separators=(",", ":"))))
-            out.append(sse_data(json.dumps(_openai_usage_chunk(model, input_tokens, output_tokens), separators=(",", ":"))))
-            out.append("data: [DONE]")
-            finished = True
-    if not finished:
-        if not started:
-            out.append(sse_data(json.dumps(_openai_chunk(model, "", None), separators=(",", ":"))))
-        finish = _openai_chunk(model, None, stop_reason)
-        finish["choices"][0]["delta"] = {}
-        out.append(sse_data(json.dumps(finish, separators=(",", ":"))))
-        out.append(sse_data(json.dumps(_openai_usage_chunk(model, input_tokens, output_tokens), separators=(",", ":"))))
-        out.append("data: [DONE]")
+            close_stream()
+    close_stream()
     return out
 
 
 def gemini_sse_to_openai(frames, model):
-    """A Gemini :streamGenerateContent stream as OpenAI chunks + usage + [DONE]."""
+    """A Gemini :streamGenerateContent stream as OpenAI chunks + usage + [DONE].
+
+    Text parts become content chunks. A functionCall part becomes an
+    OpenAI tool call, with the call id derived from the function name and
+    the arguments serialised as one JSON string, so the client's tool call
+    is complete. When the stream carried any function call, the closing
+    chunk's finish reason is tool_calls, not stop, so the client runs the
+    tools instead of treating the answer as plain text.
+    """
     out = []
     started = False
     finished = False
     input_tokens = 0
     output_tokens = 0
     stop_reason = "stop"
+    saw_tool = False
+    next_tool = 0
+
+    def open_chunk():
+        nonlocal started
+        if not started:
+            out.append(sse_data(json.dumps(_openai_chunk(model, "", None), separators=(",", ":"))))
+            started = True
+
+    def close_stream():
+        nonlocal finished
+        if finished:
+            return
+        open_chunk()
+        reason = "tool_calls" if saw_tool else stop_reason
+        chunk = _openai_chunk(model, None, reason)
+        chunk["choices"][0]["delta"] = {}
+        out.append(sse_data(json.dumps(chunk, separators=(",", ":"))))
+        out.append(sse_data(json.dumps(_openai_usage_chunk(model, input_tokens, output_tokens), separators=(",", ":"))))
+        out.append("data: [DONE]")
+        finished = True
+
     for _event, data in frames:
         try:
             obj = json.loads(data)
@@ -1461,10 +1581,23 @@ def gemini_sse_to_openai(frames, model):
         text = "".join(part.get("text", "") for part in parts
                        if isinstance(part, dict) and isinstance(part.get("text"), str))
         if text != "":
-            if not started:
-                out.append(sse_data(json.dumps(_openai_chunk(model, "", None), separators=(",", ":"))))
-                started = True
+            open_chunk()
             out.append(sse_data(json.dumps(_openai_chunk(model, text, None), separators=(",", ":"))))
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            call = part.get("functionCall")
+            if not isinstance(call, dict):
+                continue
+            name = call.get("name") if isinstance(call.get("name"), str) else ""
+            args = call.get("args") if isinstance(call.get("args"), dict) else {}
+            call_id = "call_%s" % name
+            open_chunk()
+            out.append(sse_data(json.dumps(
+                _openai_tool_chunk(model, next_tool, call_id, name, json.dumps(args, separators=(",", ":"))),
+                separators=(",", ":"))))
+            next_tool += 1
+            saw_tool = True
         usage = obj.get("usageMetadata")
         if isinstance(usage, dict):
             input_tokens = num_or_zero(usage.get("promptTokenCount"))
@@ -1472,34 +1605,30 @@ def gemini_sse_to_openai(frames, model):
         finish = candidate.get("finishReason")
         if isinstance(finish, str):
             stop_reason = gemini_to_oa_stop(finish)
-            if not started:
-                out.append(sse_data(json.dumps(_openai_chunk(model, "", None), separators=(",", ":"))))
-                started = True
-            chunk = _openai_chunk(model, None, stop_reason)
-            chunk["choices"][0]["delta"] = {}
-            out.append(sse_data(json.dumps(chunk, separators=(",", ":"))))
-            out.append(sse_data(json.dumps(_openai_usage_chunk(model, input_tokens, output_tokens), separators=(",", ":"))))
-            out.append("data: [DONE]")
-            finished = True
-    if not finished:
-        if not started:
-            out.append(sse_data(json.dumps(_openai_chunk(model, "", None), separators=(",", ":"))))
-        chunk = _openai_chunk(model, None, stop_reason)
-        chunk["choices"][0]["delta"] = {}
-        out.append(sse_data(json.dumps(chunk, separators=(",", ":"))))
-        out.append(sse_data(json.dumps(_openai_usage_chunk(model, input_tokens, output_tokens), separators=(",", ":"))))
-        out.append("data: [DONE]")
+            close_stream()
+    close_stream()
     return out
 
 
 def gemini_sse_to_anthropic(frames, model):
-    """A Gemini :streamGenerateContent stream as Anthropic events."""
+    """A Gemini :streamGenerateContent stream as Anthropic events.
+
+    Text parts become one text block (index 0). A functionCall part
+    becomes a tool_use block on its own index: content_block_start
+    carries the id and name, an input_json_delta carries the arguments
+    as one JSON string, and content_block_stop closes it. When the stream
+    carried any function call, the message stops with tool_use, not
+    end_turn, so the client runs the tools. Dropping the calls would turn
+    a tool-using answer into plain text.
+    """
     out = []
     started = False
     block_open = False
     finished = False
     output_tokens = 0
     stop_reason = "end_turn"
+    saw_tool = False
+    next_index = 1
 
     def start_message():
         return sse_event("message_start", {
@@ -1511,6 +1640,24 @@ def gemini_sse_to_anthropic(frames, model):
                 "usage": {"input_tokens": 0, "output_tokens": 0},
             },
         })
+
+    def close_message():
+        nonlocal finished, block_open
+        if finished:
+            return
+        if not started:
+            out.append(start_message())
+        if block_open:
+            out.append(sse_event("content_block_stop", {"type": "content_block_stop", "index": 0}))
+            block_open = False
+        reason = "tool_use" if saw_tool else stop_reason
+        out.append(sse_event("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": reason, "stop_sequence": None},
+            "usage": {"output_tokens": output_tokens},
+        }))
+        out.append(sse_event("message_stop", {"type": "message_stop"}))
+        finished = True
 
     for _event, data in frames:
         try:
@@ -1544,34 +1691,38 @@ def gemini_sse_to_anthropic(frames, model):
                 "type": "content_block_delta", "index": 0,
                 "delta": {"type": "text_delta", "text": text},
             }))
-        finish = candidate.get("finishReason")
-        if isinstance(finish, str):
-            stop_reason = gemini_to_anth_stop(finish)
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            call = part.get("functionCall")
+            if not isinstance(call, dict):
+                continue
+            name = call.get("name") if isinstance(call.get("name"), str) else ""
+            args = call.get("args") if isinstance(call.get("args"), dict) else {}
+            call_id = "call_%s" % name
+            index = next_index
+            next_index += 1
             if not started:
                 out.append(start_message())
                 started = True
             if block_open:
                 out.append(sse_event("content_block_stop", {"type": "content_block_stop", "index": 0}))
                 block_open = False
-            out.append(sse_event("message_delta", {
-                "type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": {"output_tokens": output_tokens},
+            out.append(sse_event("content_block_start", {
+                "type": "content_block_start", "index": index,
+                "content_block": {"type": "tool_use", "id": call_id, "name": name, "input": {}},
             }))
-            out.append(sse_event("message_stop", {"type": "message_stop"}))
-            finished = True
-    if not finished:
-        if not started:
-            out.append(start_message())
-            started = True
-        if block_open:
-            out.append(sse_event("content_block_stop", {"type": "content_block_stop", "index": 0}))
-        out.append(sse_event("message_delta", {
-            "type": "message_delta",
-            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": output_tokens},
-        }))
-        out.append(sse_event("message_stop", {"type": "message_stop"}))
+            out.append(sse_event("content_block_delta", {
+                "type": "content_block_delta", "index": index,
+                "delta": {"type": "input_json_delta", "partial_json": json.dumps(args, separators=(",", ":"))},
+            }))
+            out.append(sse_event("content_block_stop", {"type": "content_block_stop", "index": index}))
+            saw_tool = True
+        finish = candidate.get("finishReason")
+        if isinstance(finish, str):
+            stop_reason = gemini_to_anth_stop(finish)
+            close_message()
+    close_message()
     return out
 
 
@@ -1637,11 +1788,22 @@ def requirements_for(body):
     return requirements_from_body(body)
 
 
+OVER_PLAN_PENALTY = 60
+REFUSAL_PENALTY = 40
+MAX_REFUSAL_STEPS = 2
+
+
 def build_candidates(requires, json_mode):
-    """(provider_id, model_id, rating) pairs: free models meeting the
-    requirements. A JSON-mode request never goes to an anthropic-wire provider
-    (that wire cannot carry response_format)."""
-    cands = []
+    """Every (provider_id, model_id, rating) that could serve this request.
+
+    A candidate is a free model on a probed provider whose capabilities meet
+    the request's requirements. A JSON-mode request never goes to an
+    anthropic-wire provider, because that wire cannot carry response_format.
+    Nothing is filtered out here: ranking decides the order, and the serving
+    loop tries candidates until one answers, so a provider is never silently
+    dropped from a request it could have served.
+    """
+    found = []
     for probe in PROBES:
         if not probe["ok"]:
             continue
@@ -1653,22 +1815,46 @@ def build_candidates(requires, json_mode):
                 continue
             if not meets_requirements(requires, model["caps"]):
                 continue
-            cands.append((provider["id"], model["id"], model["rating"]))
-    return cands
+            found.append((provider["id"], model["id"], model["rating"]))
+    return found
+
+
+def _ranking_penalty(provider_id):
+    """Rating points subtracted when ordering one provider's candidates.
+
+    Two soft costs, both capped, both recoverable. A provider that has used
+    its safe call floor (CALLS_MIN, the minimum the draw guarantees, not a
+    hard cap) costs OVER_PLAN_PENALTY, because its remaining budget is
+    uncertain and a fresh provider should go first when the ratings are
+    close. Each recent refusal costs REFUSAL_PENALTY, up to
+    MAX_REFUSAL_STEPS steps, because a provider that just refused is more
+    likely to refuse again. Neither cost excludes the provider: a clearly
+    better model still outranks a worse one, and a provider whose every
+    rival has already failed is still tried.
+    """
+    cost = 0
+    if calls_used.get(provider_id, 0) >= CALLS_MIN.get(provider_id, 5):
+        cost += OVER_PLAN_PENALTY
+    cost += REFUSAL_PENALTY * min(refusals.get(provider_id, 0), MAX_REFUSAL_STEPS)
+    return cost
 
 
 def rank_candidates(cands):
-    """Best first: rating desc, refusals asc, calls_used asc, provider id,
-    model id. Providers that refused twice or reached their safe call plan
-    are avoided unless no other candidate exists."""
-    preferred = [
-        cand for cand in cands
-        if refusals.get(cand[0], 0) < 2
-        and calls_used.get(cand[0], 0) < CALLS_MIN.get(cand[0], 5)
-    ]
-    pool = preferred if preferred else cands
-    return sorted(pool, key=lambda cand: (
-        -cand[2], refusals.get(cand[0], 0), calls_used.get(cand[0], 0), cand[0], cand[1]))
+    """All candidates, best first, by effective rating.
+
+    The effective rating is the quality-table rating minus the ranking
+    penalty, so a provider past its safe floor or with recent refusals is
+    pushed down, never removed. Ties break toward the provider that has
+    spent fewer calls and refused less, then by provider and model id for
+    determinism. The list is complete: the serving loop walks it until a
+    provider answers, which is what makes "exceed the safe floor only when
+    no other provider can serve" true in practice.
+    """
+    return sorted(cands, key=lambda cand: (
+        -(cand[2] - _ranking_penalty(cand[0])),
+        calls_used.get(cand[0], 0),
+        refusals.get(cand[0], 0),
+        cand[0], cand[1]))
 
 
 def build_upstream_request(prov, model_id, client_wire, body, is_stream):
@@ -1706,11 +1892,33 @@ def build_upstream_request(prov, model_id, client_wire, body, is_stream):
     return url, headers, up
 
 
+def _is_concurrent_refusal(data):
+    """True when a refusal body names a concurrency limit, not a budget.
+
+    The env refuses a second in-flight call to a one-at-a-time provider
+    with 429 and the code "concurrent_requests", in the wire's own error
+    shape (OpenAI puts it in error.code, Anthropic in error.type, Gemini
+    in error.status). That refusal spends no call and is not a strike
+    against the provider: the provider is healthy, it was just busy.
+    """
+    try:
+        text = data.decode("utf-8", "replace")
+    except Exception:
+        return False
+    return "concurrent_requests" in text
+
+
 def attempt(prov, model_id, client_wire, body, is_stream):
     """One provider call. Returns (status, content_type, body_bytes) on a
-    200, else None (fail over). Budget accounting mirrors the env: a 200, a
-    402/429 failure or a 5xx spends one call; a 400, a 401 or a
-    concurrent_requests 429 spends none."""
+    200, else None, and the caller fails over to the next candidate.
+
+    Budget accounting mirrors the env. A 200, a 402 or 429 failure, or a
+    5xx spends one call on that provider. A 400, a 401, or a
+    concurrent_requests 429 spends none: the call never reached the
+    provider's budget. A network error spends none either. A success
+    clears the provider's refusal count, so a provider that had transient
+    failures is not penalised forever; a refusal adds one strike.
+    """
     pid = prov["id"]
     url, headers, up_body = build_upstream_request(prov, model_id, client_wire, body, is_stream)
     try:
@@ -1724,6 +1932,7 @@ def attempt(prov, model_id, client_wire, body, is_stream):
         return None
     if status == 200:
         calls_used[pid] = calls_used.get(pid, 0) + 1
+        refusals[pid] = 0
         if is_stream:
             out = translate_stream(prov["wire"], client_wire, data, model_id)
             return (200, "text/event-stream; charset=utf-8", out)
@@ -1738,6 +1947,8 @@ def attempt(prov, model_id, client_wire, body, is_stream):
         translated = translate_json_answer(prov["wire"], client_wire, answer, model_id)
         return (200, "application/json",
                 json.dumps(translated, separators=(",", ":")).encode("utf-8"))
+    if status == 429 and _is_concurrent_refusal(data):
+        return None
     if status == 402 or status == 429 or status >= 500:
         calls_used[pid] = calls_used.get(pid, 0) + 1
         refusals[pid] = refusals.get(pid, 0) + 1
@@ -1748,7 +1959,18 @@ def attempt(prov, model_id, client_wire, body, is_stream):
 
 def serve(client_wire, body):
     """Serve one client request. Returns (status, content_type, body_bytes),
-    or None when no provider could serve it."""
+    or None only when no provider on the whole ranked list could serve it.
+
+    The ranked list is complete: every free model that meets the request
+    is on it, ordered by effective rating. Pass 1 tries one model per
+    provider, so a failure moves to a different provider first. Pass 2
+    tries a second model on a provider already tried, for failures that
+    were model-specific rather than provider-wide. Because the list is
+    complete, a provider that is past its safe floor or has recent
+    refusals is still reached when every fresher provider has failed:
+    the safe floor is exceeded only when no other provider can serve,
+    which is the rule as written, not just as intended.
+    """
     requires = requirements_for(body)
     is_stream = body.get("stream") is True
     if client_wire == "openai":
@@ -1763,8 +1985,6 @@ def serve(client_wire, body):
     tried_providers = set()
     tried_models = set()
     attempts = 0
-    # Pass 1: one attempt per provider (fail over to a different provider).
-    # Pass 2: a different model on a provider already tried.
     for pass_no in (1, 2):
         for pid, mid, _rating in ranked:
             if attempts >= MAX_ATTEMPTS:
@@ -1796,18 +2016,58 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def _read_chunked_body(self):
+        """Read a Transfer-Encoding: chunked request body, up to MAX_BODY.
+
+        Each chunk is a hex size line, that many bytes, then CRLF; a
+        zero-size chunk ends the body. Returns the raw bytes, or None when
+        the framing is broken or the body is too large.
+        """
+        parts = []
+        total = 0
+        while True:
+            size_line = self.rfile.readline(MAX_BODY + 64)
+            if not size_line:
+                return None
+            size_text = size_line.decode("ascii", "replace").strip().split(";", 1)[0].strip()
+            try:
+                size = int(size_text, 16)
+            except ValueError:
+                return None
+            if size < 0:
+                return None
+            if size == 0:
+                self.rfile.readline(64)
+                break
+            total += size
+            if total > MAX_BODY:
+                return None
+            chunk = self.rfile.read(size)
+            if chunk is None or len(chunk) != size:
+                return None
+            parts.append(chunk)
+            crlf = self.rfile.read(2)
+            if crlf != b"\r\n":
+                return None
+        return b"".join(parts)
+
     def _read_body(self):
         length = self.headers.get("Content-Length")
-        if length is None:
-            return None
-        try:
-            size = int(length)
-        except ValueError:
-            return None
-        if size < 0 or size > MAX_BODY:
-            return None
-        data = self.rfile.read(size)
-        if not data:
+        if length is not None:
+            try:
+                size = int(length)
+            except ValueError:
+                return None
+            if size < 0 or size > MAX_BODY:
+                return None
+            data = self.rfile.read(size)
+            if not data:
+                return None
+        elif (self.headers.get("Transfer-Encoding") or "").lower() == "chunked":
+            data = self._read_chunked_body()
+            if data is None:
+                return None
+        else:
             return None
         try:
             value = json.loads(data.decode("utf-8"))
